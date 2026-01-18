@@ -13,6 +13,7 @@ PRIVACY_URL = os.getenv("PRIVACY_URL", "https://privacy.com.br/checkout/miasoph"
 # Estado simples em memória (reinicia quando reinicia o servidor)
 # status: "new" -> ainda não confirmou +18
 #         "adult_ok" -> confirmou +18
+# lang: idioma atual (pt/en/es) baseado na ÚLTIMA mensagem recebida
 USER_STATE = {}
 
 
@@ -41,32 +42,56 @@ def normalize(text: str) -> str:
     return (text or "").strip().lower()
 
 
-def detect_lang(text: str) -> str:
+def detect_lang(text: str):
     """
-    Heurística simples: tenta identificar PT vs EN.
-    Retorna: 'pt' ou 'en'
+    Heurística simples PT/EN/ES.
+    Retorna: 'pt', 'en', 'es' ou None (quando não dá pra confiar: texto curto/ambíguo).
     """
     t = normalize(text)
 
+    # Evita troca errada com mensagens muito curtas tipo "ok", "kk", "?" etc.
+    # (nesses casos, mantemos o idioma anterior)
+    if len(t) < 6:
+        return None
+
+    letters = sum(ch.isalpha() for ch in t)
+    if letters < 4:
+        return None
+
     pt_hints = [
-        "oi", "olá", "ola", "tudo bem", "preço", "preco", "quanto",
-        "conteúdo", "conteudo", "quero", "sim", "não", "nao", "amor", "obrigad"
+        "oi", "olá", "ola", "tudo bem", "preço", "preco", "quanto", "valor",
+        "conteúdo", "conteudo", "quero", "sim", "não", "nao", "amor", "obrigad",
+        "privacidade", "seguro", "sigilo", "ver", "fotos", "vídeos", "videos"
     ]
     en_hints = [
         "hi", "hello", "price", "how much", "content", "link", "i want",
-        "yes", "no", "baby", "sweetheart", "thanks"
+        "yes", "no", "baby", "sweetheart", "thanks", "privacy", "safe", "discreet",
+        "see", "photos", "videos"
+    ]
+    es_hints = [
+        "hola", "precio", "cuánto", "cuanto", "contenido", "quiero", "sí", "si", "no",
+        "amor", "gracias", "privacidad", "seguro", "discreto", "ver", "fotos", "videos", "enlace", "link"
     ]
 
     pt_score = sum(1 for w in pt_hints if w in t)
     en_score = sum(1 for w in en_hints if w in t)
+    es_score = sum(1 for w in es_hints if w in t)
 
-    # desempate: padrão PT (público inicial BR)
-    return "en" if en_score > pt_score else "pt"
+    # Se não achou nenhum sinal forte, não troca.
+    if pt_score == 0 and en_score == 0 and es_score == 0:
+        return None
+
+    # Escolhe o maior score; desempate favorece PT (público inicial BR)
+    if en_score > pt_score and en_score >= es_score:
+        return "en"
+    if es_score > pt_score and es_score > en_score:
+        return "es"
+    return "pt"
 
 
 def tmsg(lang: str, key: str, privacy_url: str) -> str:
     """
-    Pequeno dicionário de mensagens PT/EN.
+    Pequeno dicionário de mensagens PT/EN/ES.
     """
     M = {
         "pt": {
@@ -93,6 +118,18 @@ def tmsg(lang: str, key: str, privacy_url: str) -> str:
             "link": f"Here you go 💜 {privacy_url}",
             "fallback": f"Got it 💜 Tell me: do you prefer soft or spicy?\nDirect link: {privacy_url}",
         },
+        "es": {
+            "greet_gate": "Hola, amor 💜 Soy Mia.\nAntes de continuar: ¿puedes confirmar que eres mayor de 18? (responde 'sí' o 'no')",
+            "need_18": "Antes de seguir 💜 necesito confirmar: ¿eres mayor de 18? (sí/no)",
+            "adult_ok": f"Perfecto 💜 Gracias por confirmar.\nAquí está mi link de contenido exclusivo: {privacy_url}\nSi quieres, dime qué prefieres (más soft, más atrevido, fotos, videos).",
+            "adult_no": "No hay problema 🙂 Por seguridad, solo puedo continuar con mayores de 18.\nSi vuelves después, escríbeme cuando seas +18.",
+            "menu": "Opciones:\n1) 'quiero ver' (acceso)\n2) 'precio' (info)\n3) 'privacidad' (cómo funciona)\n4) 'parar' (terminar)\nTip: para enviarte el link, necesito confirmar que eres 18+.",
+            "stop": "Listo 💜 Si quieres volver, solo di 'hola'.",
+            "privacy": f"Sí 💜 Todo es por Privacy, exclusivo y discreto.\nAquí está el link otra vez: {privacy_url}",
+            "price": f"En Privacy puedes ver los planes/precios 💜\n¿Quieres el link? {privacy_url}",
+            "link": f"Aquí tienes 💜 {privacy_url}",
+            "fallback": f"Entiendo 💜 Dime: ¿prefieres algo más soft o más atrevido?\nLink directo: {privacy_url}",
+        },
     }
     base = M.get(lang, M["pt"])
     return base.get(key, M["pt"].get(key, ""))
@@ -100,24 +137,41 @@ def tmsg(lang: str, key: str, privacy_url: str) -> str:
 
 def is_affirmative(text: str) -> bool:
     t = normalize(text)
-    return t in {"sim", "s", "yes", "y", "claro", "ok", "confirmo", "sou", "tenho 18", "18+", "+18"}
+    return t in {
+        # PT
+        "sim", "s", "claro", "ok", "confirmo", "sou", "tenho 18", "18+", "+18",
+        # EN
+        "yes", "y", "i'm 18", "im 18", "i am 18",
+        # ES
+        "sí", "si", "claro", "tengo 18", "soy mayor", "18+", "+18"
+    }
 
 
 def is_negative(text: str) -> bool:
     t = normalize(text)
-    return t in {"não", "nao", "n", "no", "negativo"}
+    return t in {
+        # PT
+        "não", "nao", "n", "negativo",
+        # EN/ES
+        "no"
+    }
 
 
 def handle_message(psid: str, incoming_text: str):
-    state = USER_STATE.get(psid, {"status": "new", "ts": time.time()})
+    # Pega estado existente ou cria
+    state = USER_STATE.get(psid, {"status": "new", "ts": time.time(), "lang": "pt"})
     status = state.get("status", "new")
 
-    # idioma do usuário (salva na primeira mensagem)
-    lang = state.get("lang")
-    if not lang:
-        lang = detect_lang(incoming_text)
-        state["lang"] = lang
-        USER_STATE[psid] = state
+    # ====== MUDANÇA PRINCIPAL: idioma acompanha a ÚLTIMA mensagem ======
+    detected = detect_lang(incoming_text)
+    if detected:
+        state["lang"] = detected
+    lang = state.get("lang", "pt")
+
+    # atualiza timestamp e persiste estado (sempre)
+    state["ts"] = time.time()
+    USER_STATE[psid] = state
+    # ================================================================
 
     t = normalize(incoming_text)
 
@@ -140,15 +194,15 @@ def handle_message(psid: str, incoming_text: str):
             return send_text(psid, tmsg(lang, "adult_no", PRIVACY_URL))
 
         # Mensagens comuns antes do gate
-        if any(k in t for k in ["oi", "olá", "ola", "hey", "hello", "hi"]):
+        if any(k in t for k in ["oi", "olá", "ola", "hey", "hello", "hi", "hola"]):
             USER_STATE[psid] = {"status": "new", "ts": time.time(), "lang": lang}
             return send_text(psid, tmsg(lang, "greet_gate", PRIVACY_URL))
 
-        if any(k in t for k in ["preço", "preco", "valor", "quanto", "price", "how much"]):
+        if any(k in t for k in ["preço", "preco", "valor", "quanto", "price", "how much", "precio", "cuanto", "cuánto"]):
             USER_STATE[psid] = {"status": "new", "ts": time.time(), "lang": lang}
             return send_text(psid, tmsg(lang, "need_18", PRIVACY_URL))
 
-        if any(k in t for k in ["link", "privacy", "conteúdo", "conteudo", "ver", "content", "see"]):
+        if any(k in t for k in ["link", "privacy", "conteúdo", "conteudo", "ver", "content", "see", "contenido", "enlace"]):
             USER_STATE[psid] = {"status": "new", "ts": time.time(), "lang": lang}
             return send_text(psid, tmsg(lang, "need_18", PRIVACY_URL))
 
@@ -157,13 +211,13 @@ def handle_message(psid: str, incoming_text: str):
         return send_text(psid, tmsg(lang, "need_18", PRIVACY_URL))
 
     # Se já confirmou +18
-    if any(k in t for k in ["link", "privacy", "conteúdo", "conteudo", "ver", "content", "see"]):
+    if any(k in t for k in ["link", "privacy", "conteúdo", "conteudo", "ver", "content", "see", "contenido", "enlace"]):
         return send_text(psid, tmsg(lang, "link", PRIVACY_URL))
 
-    if any(k in t for k in ["preço", "preco", "valor", "quanto", "price", "how much"]):
+    if any(k in t for k in ["preço", "preco", "valor", "quanto", "price", "how much", "precio", "cuanto", "cuánto"]):
         return send_text(psid, tmsg(lang, "price", PRIVACY_URL))
 
-    if any(k in t for k in ["privacidade", "seguro", "sigilo", "privacy", "safe", "discreet"]):
+    if any(k in t for k in ["privacidade", "seguro", "sigilo", "privacy", "safe", "discreet", "privacidad", "seguro", "discreto"]):
         return send_text(psid, tmsg(lang, "privacy", PRIVACY_URL))
 
     # fallback pós-gate
