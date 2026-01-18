@@ -13,7 +13,7 @@ PRIVACY_URL = os.getenv("PRIVACY_URL", "https://privacy.com.br/checkout/miasoph"
 # Estado simples em memória (reinicia quando reinicia o servidor)
 # status: "new" -> ainda não confirmou +18
 #         "adult_ok" -> confirmou +18
-# lang: idioma atual (pt/en/es) baseado na ÚLTIMA mensagem recebida
+# lang: idioma atual (pt/en/es) com base NA ÚLTIMA mensagem confiável
 USER_STATE = {}
 
 
@@ -44,44 +44,72 @@ def normalize(text: str) -> str:
 
 def detect_lang(text: str):
     """
-    Heurística simples PT/EN/ES.
-    Retorna: 'pt', 'en', 'es' ou None (quando não dá pra confiar: texto curto/ambíguo).
+    Heurística PT/EN/ES melhorada.
+    Retorna: 'pt', 'en', 'es' ou None (quando não dá pra confiar).
     """
     t = normalize(text)
-
-    # Evita troca errada com mensagens muito curtas tipo "ok", "kk", "?" etc.
-    # (nesses casos, mantemos o idioma anterior)
-    if len(t) < 6:
+    if not t:
         return None
 
+    # 1) Pedidos explícitos de idioma (troca imediata)
+    # Exemplos: "do you speak english?", "I don't speak portuguese", "en español"
+    if any(x in t for x in [
+        "speak english", "do you speak english", "english please", "in english",
+        "i dont speak portuguese", "i don't speak portuguese", "i dont speak portugués", "i don't speak portugués"
+    ]):
+        return "en"
+
+    if any(x in t for x in [
+        "fale português", "falar português", "em português",
+        "speak portuguese", "in portuguese", "portuguese please", "português"
+    ]):
+        return "pt"
+
+    if any(x in t for x in [
+        "hablas español", "habla español", "en español", "español", "espanol", "hablas espanol"
+    ]):
+        return "es"
+
+    # 2) Saudações curtas (agora troca mesmo com "hello"/"hi"/"hola"/"oi")
+    short = t.replace("!", "").replace(".", "").replace("?", "").strip()
+    if short in {"hi", "hello", "hey"}:
+        return "en"
+    if short in {"hola", "buenas"}:
+        return "es"
+    if short in {"oi", "olá", "ola"}:
+        return "pt"
+
+    # 3) Texto muito curto/ambíguo: não troca idioma
+    if len(t) < 3:
+        return None
     letters = sum(ch.isalpha() for ch in t)
-    if letters < 4:
+    if letters < 2:
         return None
 
+    # 4) Pontos por pistas (mais abrangente)
     pt_hints = [
-        "oi", "olá", "ola", "tudo bem", "preço", "preco", "quanto", "valor",
-        "conteúdo", "conteudo", "quero", "sim", "não", "nao", "amor", "obrigad",
-        "privacidade", "seguro", "sigilo", "ver", "fotos", "vídeos", "videos"
+        "você", "vc", "pra", "para", "com", "tudo bem", "preço", "preco", "quanto", "valor",
+        "conteúdo", "conteudo", "quero", "sim", "não", "nao", "obrigad", "fotos", "vídeos", "videos",
+        "privacidade", "seguro", "sigilo"
     ]
     en_hints = [
-        "hi", "hello", "price", "how much", "content", "link", "i want",
-        "yes", "no", "baby", "sweetheart", "thanks", "privacy", "safe", "discreet",
-        "see", "photos", "videos"
+        "i ", "you", "do you", "can you", "what", "whats", "what's", "name", "price", "how much",
+        "content", "link", "yes", "no", "thanks", "photo", "video", "speak", "dont", "don't",
+        "privacy", "safe", "discreet"
     ]
     es_hints = [
-        "hola", "precio", "cuánto", "cuanto", "contenido", "quiero", "sí", "si", "no",
-        "amor", "gracias", "privacidad", "seguro", "discreto", "ver", "fotos", "videos", "enlace", "link"
+        "yo", "tú", "tu", "puedes", "qué", "que", "como", "cuánto", "cuanto", "precio",
+        "contenido", "quiero", "sí", "si", "gracias", "foto", "video", "hablas",
+        "privacidad", "seguro", "discreto"
     ]
 
     pt_score = sum(1 for w in pt_hints if w in t)
     en_score = sum(1 for w in en_hints if w in t)
     es_score = sum(1 for w in es_hints if w in t)
 
-    # Se não achou nenhum sinal forte, não troca.
     if pt_score == 0 and en_score == 0 and es_score == 0:
         return None
 
-    # Escolhe o maior score; desempate favorece PT (público inicial BR)
     if en_score > pt_score and en_score >= es_score:
         return "en"
     if es_score > pt_score and es_score > en_score:
@@ -158,20 +186,20 @@ def is_negative(text: str) -> bool:
 
 
 def handle_message(psid: str, incoming_text: str):
-    # Pega estado existente ou cria
     state = USER_STATE.get(psid, {"status": "new", "ts": time.time(), "lang": "pt"})
     status = state.get("status", "new")
 
-    # ====== MUDANÇA PRINCIPAL: idioma acompanha a ÚLTIMA mensagem ======
+    # ====== ALTERAÇÃO PRINCIPAL ======
+    # idioma acompanha a ÚLTIMA mensagem recebida (se detecção for confiável)
     detected = detect_lang(incoming_text)
     if detected:
         state["lang"] = detected
     lang = state.get("lang", "pt")
+    # ================================
 
-    # atualiza timestamp e persiste estado (sempre)
+    # Atualiza timestamp e persiste o estado sempre
     state["ts"] = time.time()
     USER_STATE[psid] = state
-    # ================================================================
 
     t = normalize(incoming_text)
 
@@ -194,7 +222,7 @@ def handle_message(psid: str, incoming_text: str):
             return send_text(psid, tmsg(lang, "adult_no", PRIVACY_URL))
 
         # Mensagens comuns antes do gate
-        if any(k in t for k in ["oi", "olá", "ola", "hey", "hello", "hi", "hola"]):
+        if any(k in t for k in ["oi", "olá", "ola", "hey", "hello", "hi", "hola", "buenas"]):
             USER_STATE[psid] = {"status": "new", "ts": time.time(), "lang": lang}
             return send_text(psid, tmsg(lang, "greet_gate", PRIVACY_URL))
 
@@ -217,7 +245,7 @@ def handle_message(psid: str, incoming_text: str):
     if any(k in t for k in ["preço", "preco", "valor", "quanto", "price", "how much", "precio", "cuanto", "cuánto"]):
         return send_text(psid, tmsg(lang, "price", PRIVACY_URL))
 
-    if any(k in t for k in ["privacidade", "seguro", "sigilo", "privacy", "safe", "discreet", "privacidad", "seguro", "discreto"]):
+    if any(k in t for k in ["privacidade", "seguro", "sigilo", "privacy", "safe", "discreet", "privacidad", "discreto"]):
         return send_text(psid, tmsg(lang, "privacy", PRIVACY_URL))
 
     # fallback pós-gate
