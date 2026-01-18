@@ -1,5 +1,7 @@
 import os
 import time
+import re
+import unicodedata
 from flask import Flask, request
 import requests
 
@@ -42,6 +44,51 @@ def normalize(text: str) -> str:
     return (text or "").strip().lower()
 
 
+def strip_accents(s: str) -> str:
+    # remove acentos (oiê -> oie)
+    return "".join(
+        ch for ch in unicodedata.normalize("NFKD", s)
+        if not unicodedata.combining(ch)
+    )
+
+
+def greeting_lang_hint(text: str):
+    """
+    Detecta saudações com letras repetidas/variações.
+    Retorna 'pt'/'en'/'es' ou None.
+
+    Exemplos (PT):
+      oi, oii, oiiii
+      oie, oieee
+      oiê, oiêêê  (vira "oie" após strip_accents)
+
+    Exemplos (EN):
+      hi, hii, hiii
+
+    Exemplos (ES):
+      hola, holaaa
+    """
+    t = strip_accents(normalize(text))
+    if not t:
+        return None
+
+    first = t.split()[0] if t.split() else t
+
+    # PT: oi, oii, oiii... / oie, oieee...
+    if re.fullmatch(r"oi+", first) or re.fullmatch(r"oie+", first):
+        return "pt"
+
+    # EN: hi, hii, hiii...
+    if re.fullmatch(r"hi+", first):
+        return "en"
+
+    # ES: hola, holaa...
+    if re.fullmatch(r"hola+", first):
+        return "es"
+
+    return None
+
+
 def detect_lang(text: str):
     """
     Heurística PT/EN/ES melhorada.
@@ -51,11 +98,17 @@ def detect_lang(text: str):
     if not t:
         return None
 
+    # 0) Saudações com letras repetidas/variações (oii, oie, oiê, hiii...)
+    g = greeting_lang_hint(text)
+    if g:
+        return g
+
     # 1) Pedidos explícitos de idioma (troca imediata)
     # Exemplos: "do you speak english?", "I don't speak portuguese", "en español"
     if any(x in t for x in [
         "speak english", "do you speak english", "english please", "in english",
-        "i dont speak portuguese", "i don't speak portuguese", "i dont speak portugués", "i don't speak portugués"
+        "i dont speak portuguese", "i don't speak portuguese", "i dont speak portugues", "i don't speak portugues",
+        "i dont speak portugués", "i don't speak portugués"
     ]):
         return "en"
 
@@ -70,23 +123,14 @@ def detect_lang(text: str):
     ]):
         return "es"
 
-    # 2) Saudações curtas (agora troca mesmo com "hello"/"hi"/"hola"/"oi")
-    short = t.replace("!", "").replace(".", "").replace("?", "").strip()
-    if short in {"hi", "hello", "hey"}:
-        return "en"
-    if short in {"hola", "buenas"}:
-        return "es"
-    if short in {"oi", "olá", "ola"}:
-        return "pt"
-
-    # 3) Texto muito curto/ambíguo: não troca idioma
+    # 2) Texto muito curto/ambíguo: não troca idioma
     if len(t) < 3:
         return None
     letters = sum(ch.isalpha() for ch in t)
     if letters < 2:
         return None
 
-    # 4) Pontos por pistas (mais abrangente)
+    # 3) Pontos por pistas (mais abrangente)
     pt_hints = [
         "você", "vc", "pra", "para", "com", "tudo bem", "preço", "preco", "quanto", "valor",
         "conteúdo", "conteudo", "quero", "sim", "não", "nao", "obrigad", "fotos", "vídeos", "videos",
@@ -222,7 +266,8 @@ def handle_message(psid: str, incoming_text: str):
             return send_text(psid, tmsg(lang, "adult_no", PRIVACY_URL))
 
         # Mensagens comuns antes do gate
-        if any(k in t for k in ["oi", "olá", "ola", "hey", "hello", "hi", "hola", "buenas"]):
+        # (inclui oie/oiê/oii..., hi/hiii..., hola/holaaa... via greeting_lang_hint)
+        if greeting_lang_hint(incoming_text) in {"pt", "en", "es"}:
             USER_STATE[psid] = {"status": "new", "ts": time.time(), "lang": lang}
             return send_text(psid, tmsg(lang, "greet_gate", PRIVACY_URL))
 
