@@ -2,6 +2,7 @@ import os
 import time
 import re
 import unicodedata
+import random
 from flask import Flask, request
 import requests
 
@@ -19,6 +20,9 @@ PRIVACY_URL = os.getenv("PRIVACY_URL", "https://privacy.com.br/checkout/miasoph"
 USER_STATE = {}
 
 
+# =========================
+# Messenger Send
+# =========================
 def send_text(psid: str, text: str) -> bool:
     """Envia uma mensagem de texto pelo Messenger."""
     if not PAGE_ACCESS_TOKEN:
@@ -40,6 +44,9 @@ def send_text(psid: str, text: str) -> bool:
         return False
 
 
+# =========================
+# Normalização / util
+# =========================
 def normalize(text: str) -> str:
     return (text or "").strip().lower()
 
@@ -52,20 +59,26 @@ def strip_accents(s: str) -> str:
     )
 
 
+# =========================
+# Idioma (PT/EN/ES) + saudações "oii/hiii/oie/oiê"
+# =========================
+SUPPORTED_LANGS = {"pt", "en", "es"}
+
+
 def greeting_lang_hint(text: str):
     """
     Detecta saudações com letras repetidas/variações.
     Retorna 'pt'/'en'/'es' ou None.
 
-    Exemplos (PT):
+    PT:
       oi, oii, oiiii
       oie, oieee
-      oiê, oiêêê  (vira "oie" após strip_accents)
+      oiê, oiêêê (vira "oie" após strip_accents)
 
-    Exemplos (EN):
+    EN:
       hi, hii, hiii
 
-    Exemplos (ES):
+    ES:
       hola, holaaa
     """
     t = strip_accents(normalize(text))
@@ -91,7 +104,7 @@ def greeting_lang_hint(text: str):
 
 def detect_lang(text: str):
     """
-    Heurística PT/EN/ES melhorada.
+    Heurística PT/EN/ES.
     Retorna: 'pt', 'en', 'es' ou None (quando não dá pra confiar).
     """
     t = normalize(text)
@@ -104,22 +117,22 @@ def detect_lang(text: str):
         return g
 
     # 1) Pedidos explícitos de idioma (troca imediata)
-    # Exemplos: "do you speak english?", "I don't speak portuguese", "en español"
     if any(x in t for x in [
         "speak english", "do you speak english", "english please", "in english",
-        "i dont speak portuguese", "i don't speak portuguese", "i dont speak portugues", "i don't speak portugues",
-        "i dont speak portugués", "i don't speak portugués"
+        "i dont speak portuguese", "i don't speak portuguese",
+        "i dont speak portugues", "i don't speak portugues",
+        "i dont speak portugués", "i don't speak portugués",
     ]):
         return "en"
 
     if any(x in t for x in [
         "fale português", "falar português", "em português",
-        "speak portuguese", "in portuguese", "portuguese please", "português"
+        "speak portuguese", "in portuguese", "portuguese please", "português",
     ]):
         return "pt"
 
     if any(x in t for x in [
-        "hablas español", "habla español", "en español", "español", "espanol", "hablas espanol"
+        "hablas español", "habla español", "en español", "español", "espanol", "hablas espanol",
     ]):
         return "es"
 
@@ -134,17 +147,17 @@ def detect_lang(text: str):
     pt_hints = [
         "você", "vc", "pra", "para", "com", "tudo bem", "preço", "preco", "quanto", "valor",
         "conteúdo", "conteudo", "quero", "sim", "não", "nao", "obrigad", "fotos", "vídeos", "videos",
-        "privacidade", "seguro", "sigilo"
+        "privacidade", "seguro", "sigilo",
     ]
     en_hints = [
         "i ", "you", "do you", "can you", "what", "whats", "what's", "name", "price", "how much",
         "content", "link", "yes", "no", "thanks", "photo", "video", "speak", "dont", "don't",
-        "privacy", "safe", "discreet"
+        "privacy", "safe", "discreet",
     ]
     es_hints = [
         "yo", "tú", "tu", "puedes", "qué", "que", "como", "cuánto", "cuanto", "precio",
         "contenido", "quiero", "sí", "si", "gracias", "foto", "video", "hablas",
-        "privacidad", "seguro", "discreto"
+        "privacidad", "seguro", "discreto",
     ]
 
     pt_score = sum(1 for w in pt_hints if w in t)
@@ -161,10 +174,71 @@ def detect_lang(text: str):
     return "pt"
 
 
+# =========================
+# Repertório "mais pessoal" (SOMENTE após +18)
+# (SEM menção direta ao Privacy)
+# =========================
+SPICY_CHAT_LINES = {
+    "pt": [
+        "Lá, a conversa acontece direto comigo.",
+        "É lá que eu converso com quem está mais perto.",
+        "A conversa fica mais próxima… comigo.",
+        "É no chat de lá que eu me solto mais.",
+        "Lá eu converso de um jeito mais próximo.",
+        "É no chat de lá que a conversa muda.",
+        "Com quem está lá, a conversa flui diferente.",
+        "No chat de lá, eu fico mais à vontade.",
+    ],
+    "en": [
+        "There, the conversation happens directly with me.",
+        "That’s where I chat with the people who are closer.",
+        "The conversation gets closer… with me.",
+        "That’s where I loosen up more in chat.",
+        "That’s where I chat in a more personal way.",
+        "That’s where the vibe of the conversation changes.",
+        "With people there, the conversation flows differently.",
+        "In that chat, I feel more at ease.",
+    ],
+    "es": [
+        "Ahí la conversación es directamente conmigo.",
+        "Ahí converso con quienes están más cerca.",
+        "La conversación se vuelve más cercana… conmigo.",
+        "En ese chat me suelto más.",
+        "Ahí converso de una forma más personal.",
+        "Ahí cambia el tono de la conversación.",
+        "Con quien está ahí, la conversación fluye diferente.",
+        "En ese chat, me siento más a gusto.",
+    ],
+}
+
+
+def maybe_add_spicy_line(state: dict, lang: str, base_text: str, force: bool = False) -> str:
+    """
+    Adiciona UMA linha do repertório (após +18) de forma controlada.
+    - Só funciona quando status == adult_ok.
+    - Evita repetir a toda mensagem (cooldown).
+    """
+    if state.get("status") != "adult_ok":
+        return base_text
+
+    now = time.time()
+    last_ts = state.get("last_spicy_ts", 0.0)
+    cooldown_sec = 25  # ajuste se quiser mais/menos frequente
+
+    if not force and (now - last_ts) < cooldown_sec:
+        return base_text
+
+    lines = SPICY_CHAT_LINES.get(lang) or SPICY_CHAT_LINES["pt"]
+    line = random.choice(lines)
+
+    state["last_spicy_ts"] = now
+    return f"{base_text}\n\n{line}"
+
+
+# =========================
+# Mensagens base (PT/EN/ES)
+# =========================
 def tmsg(lang: str, key: str, privacy_url: str) -> str:
-    """
-    Pequeno dicionário de mensagens PT/EN/ES.
-    """
     M = {
         "pt": {
             "greet_gate": "Oi, amor 💜 Eu sou a Mia.\nAntes de continuar: você confirma que é maior de 18 anos? (responda 'sim' ou 'não')",
@@ -215,7 +289,7 @@ def is_affirmative(text: str) -> bool:
         # EN
         "yes", "y", "i'm 18", "im 18", "i am 18",
         # ES
-        "sí", "si", "claro", "tengo 18", "soy mayor", "18+", "+18"
+        "sí", "si", "tengo 18", "soy mayor", "18+", "+18",
     }
 
 
@@ -225,23 +299,26 @@ def is_negative(text: str) -> bool:
         # PT
         "não", "nao", "n", "negativo",
         # EN/ES
-        "no"
+        "no",
     }
 
 
+# =========================
+# Core handler
+# =========================
 def handle_message(psid: str, incoming_text: str):
+    # estado padrão
     state = USER_STATE.get(psid, {"status": "new", "ts": time.time(), "lang": "pt"})
     status = state.get("status", "new")
 
-    # ====== ALTERAÇÃO PRINCIPAL ======
-    # idioma acompanha a ÚLTIMA mensagem recebida (se detecção for confiável)
+    # ====== Idioma acompanha a ÚLTIMA mensagem recebida (se confiável) ======
     detected = detect_lang(incoming_text)
     if detected:
         state["lang"] = detected
     lang = state.get("lang", "pt")
-    # ================================
+    # ======================================================================
 
-    # Atualiza timestamp e persiste o estado sempre
+    # Atualiza timestamp e persiste estado sempre
     state["ts"] = time.time()
     USER_STATE[psid] = state
 
@@ -255,50 +332,74 @@ def handle_message(psid: str, incoming_text: str):
         USER_STATE.pop(psid, None)
         return send_text(psid, tmsg(lang, "stop", PRIVACY_URL))
 
-    # Se ainda não confirmou +18, gate
+    # ====== Gate +18 ======
     if status != "adult_ok":
         if is_affirmative(t):
-            USER_STATE[psid] = {"status": "adult_ok", "ts": time.time(), "lang": lang}
-            return send_text(psid, tmsg(lang, "adult_ok", PRIVACY_URL))
+            # muda status para adult_ok
+            state["status"] = "adult_ok"
+            state["ts"] = time.time()
+            USER_STATE[psid] = state
+
+            # resposta de confirmação +18 (já pode usar repertório)
+            msg = tmsg(lang, "adult_ok", PRIVACY_URL)
+            msg = maybe_add_spicy_line(state, lang, msg, force=True)  # força 1 linha aqui
+            return send_text(psid, msg)
 
         if is_negative(t):
             USER_STATE.pop(psid, None)
             return send_text(psid, tmsg(lang, "adult_no", PRIVACY_URL))
 
-        # Mensagens comuns antes do gate
-        # (inclui oie/oiê/oii..., hi/hiii..., hola/holaaa... via greeting_lang_hint)
-        if greeting_lang_hint(incoming_text) in {"pt", "en", "es"}:
-            USER_STATE[psid] = {"status": "new", "ts": time.time(), "lang": lang}
+        # Saudação antes do gate (oii/hiii/oie/oiê etc.)
+        if greeting_lang_hint(incoming_text) in SUPPORTED_LANGS:
+            state["status"] = "new"
+            state["ts"] = time.time()
+            USER_STATE[psid] = state
             return send_text(psid, tmsg(lang, "greet_gate", PRIVACY_URL))
 
+        # Perguntas de preço/link antes do gate
         if any(k in t for k in ["preço", "preco", "valor", "quanto", "price", "how much", "precio", "cuanto", "cuánto"]):
-            USER_STATE[psid] = {"status": "new", "ts": time.time(), "lang": lang}
+            state["status"] = "new"
+            state["ts"] = time.time()
+            USER_STATE[psid] = state
             return send_text(psid, tmsg(lang, "need_18", PRIVACY_URL))
 
         if any(k in t for k in ["link", "privacy", "conteúdo", "conteudo", "ver", "content", "see", "contenido", "enlace"]):
-            USER_STATE[psid] = {"status": "new", "ts": time.time(), "lang": lang}
+            state["status"] = "new"
+            state["ts"] = time.time()
+            USER_STATE[psid] = state
             return send_text(psid, tmsg(lang, "need_18", PRIVACY_URL))
 
         # fallback antes do gate
-        USER_STATE[psid] = {"status": "new", "ts": time.time(), "lang": lang}
+        state["status"] = "new"
+        state["ts"] = time.time()
+        USER_STATE[psid] = state
         return send_text(psid, tmsg(lang, "need_18", PRIVACY_URL))
 
-    # Se já confirmou +18
+    # ====== Pós +18 (aqui pode usar repertório “mais pessoal”) ======
     if any(k in t for k in ["link", "privacy", "conteúdo", "conteudo", "ver", "content", "see", "contenido", "enlace"]):
-        return send_text(psid, tmsg(lang, "link", PRIVACY_URL))
+        msg = tmsg(lang, "link", PRIVACY_URL)
+        msg = maybe_add_spicy_line(state, lang, msg)
+        return send_text(psid, msg)
 
     if any(k in t for k in ["preço", "preco", "valor", "quanto", "price", "how much", "precio", "cuanto", "cuánto"]):
-        return send_text(psid, tmsg(lang, "price", PRIVACY_URL))
+        msg = tmsg(lang, "price", PRIVACY_URL)
+        msg = maybe_add_spicy_line(state, lang, msg)
+        return send_text(psid, msg)
 
     if any(k in t for k in ["privacidade", "seguro", "sigilo", "privacy", "safe", "discreet", "privacidad", "discreto"]):
-        return send_text(psid, tmsg(lang, "privacy", PRIVACY_URL))
+        msg = tmsg(lang, "privacy", PRIVACY_URL)
+        msg = maybe_add_spicy_line(state, lang, msg)
+        return send_text(psid, msg)
 
     # fallback pós-gate
-    return send_text(psid, tmsg(lang, "fallback", PRIVACY_URL))
+    msg = tmsg(lang, "fallback", PRIVACY_URL)
+    msg = maybe_add_spicy_line(state, lang, msg)
+    return send_text(psid, msg)
 
 
-# ====== Rotas do Webhook ======
-
+# =========================
+# Webhook routes
+# =========================
 @app.get("/webhook")
 def verify_webhook():
     """
