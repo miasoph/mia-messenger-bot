@@ -17,7 +17,28 @@ PRIVACY_URL = os.getenv("PRIVACY_URL", "https://privacy.com.br/checkout/miasoph"
 # status: "new" -> ainda não confirmou +18
 #         "adult_ok" -> confirmou +18
 # lang: idioma atual (pt/en/es) com base NA ÚLTIMA mensagem confiável
+# started: marca a primeira mensagem da conversa (para contar conversas iniciadas)
+# last_spicy_ts: cooldown das frases de repertório
 USER_STATE = {}
+
+
+# =========================
+# LOGS (Render)
+# =========================
+def log_event(event: str, psid: str, state: dict, extra: str = ""):
+    """
+    Log estruturado (uma linha) para você filtrar no Render Logs.
+    Exemplos:
+      EVENT=start psid=... lang=pt status=new
+      EVENT=adult_ok psid=... lang=en status=adult_ok
+      EVENT=link_sent psid=... lang=pt status=adult_ok ctx=adult_ok
+    """
+    lang = state.get("lang", "unknown")
+    status = state.get("status", "unknown")
+    # psid pode ser sensível; aqui fica apenas os últimos 6 para debug opcional
+    psid_short = psid[-6:] if psid else "unknown"
+    suffix = f" {extra}" if extra else ""
+    print(f"EVENT={event} psid=...{psid_short} lang={lang} status={status}{suffix}")
 
 
 # =========================
@@ -308,8 +329,13 @@ def is_negative(text: str) -> bool:
 # =========================
 def handle_message(psid: str, incoming_text: str):
     # estado padrão
-    state = USER_STATE.get(psid, {"status": "new", "ts": time.time(), "lang": "pt"})
+    state = USER_STATE.get(psid, {"status": "new", "ts": time.time(), "lang": "pt", "started": False})
     status = state.get("status", "new")
+
+    # ====== LOG: conversa iniciada (primeira msg do usuário) ======
+    if state.get("started") is not True:
+        state["started"] = True
+        log_event("start", psid, state)
 
     # ====== Idioma acompanha a ÚLTIMA mensagem recebida (se confiável) ======
     detected = detect_lang(incoming_text)
@@ -340,8 +366,15 @@ def handle_message(psid: str, incoming_text: str):
             state["ts"] = time.time()
             USER_STATE[psid] = state
 
+            # LOG: +18 confirmado
+            log_event("adult_ok", psid, state)
+
             # resposta de confirmação +18 (já pode usar repertório)
             msg = tmsg(lang, "adult_ok", PRIVACY_URL)
+
+            # LOG: link enviado (porque adult_ok inclui o link)
+            log_event("link_sent", psid, state, extra="ctx=adult_ok")
+
             msg = maybe_add_spicy_line(state, lang, msg, force=True)  # força 1 linha aqui
             return send_text(psid, msg)
 
@@ -378,6 +411,10 @@ def handle_message(psid: str, incoming_text: str):
     # ====== Pós +18 (aqui pode usar repertório “mais pessoal”) ======
     if any(k in t for k in ["link", "privacy", "conteúdo", "conteudo", "ver", "content", "see", "contenido", "enlace"]):
         msg = tmsg(lang, "link", PRIVACY_URL)
+
+        # LOG: link enviado
+        log_event("link_sent", psid, state, extra="ctx=link_keyword")
+
         msg = maybe_add_spicy_line(state, lang, msg)
         return send_text(psid, msg)
 
